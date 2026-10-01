@@ -56,6 +56,9 @@ class Service:
     checkpoint: str = "checkpoints/selected"
     release_date: str = ""
     lock: LockType = field(default_factory=threading.Lock)
+    # Whether a request's questions read their shared state once; on only
+    # when it answered a sample exactly as the full read does.
+    shared: bool = False
 
 
 service = Service()
@@ -68,6 +71,15 @@ class _Pending:
     loop: asyncio.AbstractEventLoop
     future: asyncio.Future
     tokens: int = 0
+
+
+@dataclass
+class _Shared:
+    """A request whose questions share their state, answered as one job."""
+    rows: list[DecisionInput]
+    questions: list[DecisionQuestion]
+    loop: asyncio.AbstractEventLoop
+    future: asyncio.Future
 
 
 def _estimate_tokens(row: DecisionInput) -> int:
@@ -101,6 +113,10 @@ class Batcher:
 
     async def answer(self, rows: list[DecisionInput], questions: list[DecisionQuestion]) -> list[tuple[Answer, int]]:
         loop = asyncio.get_running_loop()
+        if service.shared and len(rows) > 1 and not any(row.get("images") for row in rows):
+            job = _Shared(rows, questions, loop, loop.create_future())
+            self._queue.put(job)  # type: ignore[arg-type]
+            return await job.future
         pending = [_Pending(row, question, loop, loop.create_future(), _estimate_tokens(row))
                    for row, question in zip(rows, questions, strict=True)]
         for item in pending:
@@ -113,20 +129,41 @@ class Batcher:
 
         held: _Pending | None = None
         while True:
-            items = [held or self._queue.get()]
+            first = held or self._queue.get()
             held = None
+            if isinstance(first, _Shared):
+                self._shared(first, answer, torch)
+                continue
+            items = [first]
             longest = items[0].tokens
             while len(items) < BATCH_ROWS:
                 try:
                     item = self._queue.get_nowait()
                 except queue.Empty:
                     break
-                if (len(items) + 1) * max(longest, item.tokens) > BATCH_TOKENS:
+                if isinstance(item, _Shared) or (len(items) + 1) * max(longest, item.tokens) > BATCH_TOKENS:
                     held = item     # first in the next pass, so it keeps its turn
                     break
                 items.append(item)
                 longest = max(longest, item.tokens)
             self._answer(items, answer, torch)
+
+    @staticmethod
+    def _shared(job: _Shared, answer, torch) -> None:
+        try:
+            model = service.model
+            if model is None:
+                raise RuntimeError("The model is not ready.")
+            distributions, read = model.shared_distributions(job.rows)
+            share = read // max(len(job.rows), 1)
+            result = [(answer(q, values[:len(_options(q))]), share)
+                      for q, values in zip(job.questions, distributions, strict=True)]
+        except Exception as error:  # noqa: BLE001
+            if isinstance(error, torch.cuda.OutOfMemoryError):
+                torch.cuda.empty_cache()
+            job.loop.call_soon_threadsafe(_settle, job.future, None, error)
+            return
+        job.loop.call_soon_threadsafe(_settle, job.future, result, None)
 
     def _answer(self, items: list[_Pending], answer, torch) -> None:
         try:
@@ -164,6 +201,37 @@ class Batcher:
                    for item, values, count in zip(items, distributions, batch.counts, strict=True)]
         for item, result in zip(items, results, strict=True):
             item.loop.call_soon_threadsafe(_settle, item.future, result, None)
+
+
+def _options(question: DecisionQuestion) -> list:
+    from autojev.model import options
+
+    return options(question)[0]
+
+
+def _shared_matches(model: DecisionModel) -> bool:
+    """Whether reading the shared state once answers as reading every row
+    whole does, on a request shaped like the ones served: one long state,
+    questions of each type."""
+    import torch
+
+    state = ("A scene in a product video. " * 120 + "It shows a presenter in a bright "
+             "office who says one line to camera, then a slow push-in on a dashboard.")
+    questions: list[DecisionQuestion] = [
+        {"type": "noul", "instructions": "Does the scene have speech?"},
+        {"type": "choice", "instructions": "Which canvas?",
+         "criteria": {"wide": "16:9", "tall": "9:16", "square": "1:1"}},
+        {"type": "noul", "instructions": "Is there background music?"},
+    ]
+    rows: list[DecisionInput] = [{"state": state, "question": q, "images": []} for q in questions]
+    with torch.inference_mode():
+        batch = model.prepare(rows)
+        whole = (model(batch) / model.temperature).softmax(-1).cpu().tolist()
+    shared, _ = model.shared_distributions(rows)
+    worst = max(abs(a - b) for w, sh, c in zip(whole, shared, batch.counts)
+                for a, b in zip(w[:c], sh[:c]))
+    print(f"autojev: shared-state reading differs by at most {worst:.4f} from the whole read", flush=True)
+    return worst < 0.02
 
 
 def _settle(future: asyncio.Future, result, error: BaseException | None) -> None:
@@ -253,6 +321,12 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     service.name = f"autojev-{service.model.base_model.rsplit('/', 1)[-1].lower()}"
     modified = (Path(service.checkpoint) / "decision_config.json").stat().st_mtime
     service.release_date = datetime.fromtimestamp(modified, timezone.utc).date().isoformat()
+    if os.getenv("AUTOJEV_SHARED_STATE", "1") != "0":
+        try:
+            service.shared = await run_in_threadpool(_shared_matches, service.model)
+        except Exception as error:  # noqa: BLE001 — the whole read still serves
+            print(f"autojev: shared-state reading unavailable ({error})", flush=True)
+            service.shared = False
     batcher.start()
     try:
         yield
@@ -290,7 +364,7 @@ def playground() -> str:
 def health() -> dict[str, JSONValue]:
     return {"status": "ready" if service.model is not None else "loading", "model": service.name,
             "checkpoint": service.checkpoint, "authentication": bool(os.getenv("AUTOJEV_API_KEY")),
-            "modalities": ["text", "image"]}
+            "modalities": ["text", "image"], "shared_state": service.shared}
 
 
 @app.get("/v1/models", dependencies=[Depends(authenticate)], response_model=None)

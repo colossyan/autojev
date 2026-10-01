@@ -199,6 +199,52 @@ class DecisionModel(torch.nn.Module):
         tokens = int(inputs["attention_mask"].sum())
         return PreparedBatch({name: tensor.to(self.device_name) for name, tensor in inputs.items()}, tuple(counts), tokens)
 
+    @torch.inference_mode()
+    def shared_distributions(self, rows: Sequence[DecisionInput], max_length: int = 8192
+                             ) -> tuple[list[list[float]], int]:
+        """Each row's answer distribution, reading what the rows share once.
+
+        A request's questions all open on the same state, so the tokens before
+        the first one that differs are read once into a cache and every
+        question continues from its own copy of it: a plan's thirty questions
+        about one 7k-token state cost one 7k read and thirty short ones, not
+        thirty 7k reads. Text only; rows with images take ``prepare``.
+        Returns the distributions and the tokens read."""
+        import copy
+
+        if not rows or any(row.get("images") for row in rows):
+            raise ValueError("Shared reading is for text rows only.")
+        counts: list[int] = []
+        sequences: list[list[int]] = []
+        for row in rows:
+            counts.append(len(options(row["question"])[0]))
+            text = self.processor.apply_chat_template(
+                decision_messages(row, self.codes), tokenize=False,
+                add_generation_prompt=True, enable_thinking=False,  # type: ignore[arg-type]
+            )
+            ids = cast(list[int], self.processor.tokenizer(text, add_special_tokens=False)["input_ids"])
+            if len(ids) > max_length:
+                raise ValueError(f"Question branch exceeds the {max_length}-token limit; no input was truncated.")
+            sequences.append(ids)
+        # Every row keeps at least one token of its own to read past the cache.
+        shared = min(len(ids) for ids in sequences) - 1
+        for ids in sequences[1:]:
+            shared = next((i for i in range(shared) if ids[i] != sequences[0][i]), shared)
+        device = self.device_name
+        prefix = torch.tensor([sequences[0][:shared]], device=device)
+        cache = self.backbone(input_ids=prefix, use_cache=True).past_key_values
+        out: list[list[float]] = []
+        read = shared
+        for ids, count in zip(sequences, counts, strict=True):
+            branch = torch.tensor([ids[shared:]], device=device)
+            hidden = self.backbone(input_ids=branch, past_key_values=copy.deepcopy(cache),
+                                   use_cache=True).last_hidden_state[:, -1]
+            logits = self.readout(hidden).float()[0]
+            logits[count:] = -1e9
+            out.append((logits / self.temperature).softmax(-1).cpu().tolist())
+            read += len(ids) - shared
+        return out, read
+
     def forward(self, batch: PreparedBatch) -> torch.Tensor:
         hidden: torch.Tensor = self.backbone(**batch.inputs, use_cache=False).last_hidden_state[:, -1]
         logits: torch.Tensor = self.readout(hidden).float()
