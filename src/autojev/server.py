@@ -2,10 +2,12 @@
 
 from __future__ import annotations
 
+import asyncio
 import base64
 import binascii
 import hmac
 import os
+import queue
 import threading
 import time
 import uuid
@@ -36,6 +38,13 @@ DEFAULT_MODEL = "autojev-qwen3.8-27b"
 ALIASES = {"autojev", "jev-latest", "jev-preview", "jev-1.13.0", DEFAULT_MODEL}
 
 
+# Rows per forward pass, as before; what changes is that a pass is filled from
+# every request waiting, not from one request while the rest are turned away.
+BATCH_ROWS = int(os.getenv("AUTOJEV_BATCH_ROWS", "8"))
+# Rows that may wait for a pass before a request is told the model is busy.
+MAX_WAITING_ROWS = int(os.getenv("AUTOJEV_MAX_WAITING_ROWS", "2048"))
+
+
 @dataclass
 class Service:
     model: DecisionModel | None = None
@@ -46,6 +55,92 @@ class Service:
 
 
 service = Service()
+
+
+@dataclass
+class _Pending:
+    row: DecisionInput
+    question: DecisionQuestion
+    loop: asyncio.AbstractEventLoop
+    future: asyncio.Future
+
+
+class Batcher:
+    """One worker thread that answers questions from every request at once.
+
+    The server used to take one request at a time and answer the rest 529,
+    so a caller asking a single question waited out whoever was asking, and
+    a pass ran with as few rows as that one request had. Each request now
+    queues its questions and the worker fills every pass, up to BATCH_ROWS,
+    from whatever is waiting — the same pass size, so the same memory."""
+
+    def __init__(self) -> None:
+        self._queue: queue.Queue[_Pending] = queue.Queue()
+        self._thread: threading.Thread | None = None
+
+    def start(self) -> None:
+        if self._thread is None or not self._thread.is_alive():
+            self._thread = threading.Thread(target=self._run, name="autojev-batcher", daemon=True)
+            self._thread.start()
+
+    def waiting(self) -> int:
+        return self._queue.qsize()
+
+    async def answer(self, rows: list[DecisionInput], questions: list[DecisionQuestion]) -> list[tuple[Answer, int]]:
+        loop = asyncio.get_running_loop()
+        pending = [_Pending(row, question, loop, loop.create_future()) for row, question in zip(rows, questions, strict=True)]
+        for item in pending:
+            self._queue.put(item)
+        return list(await asyncio.gather(*(item.future for item in pending)))
+
+    def _run(self) -> None:
+        import torch
+        from autojev.model import answer
+
+        while True:
+            items = [self._queue.get()]
+            while len(items) < BATCH_ROWS:
+                try:
+                    items.append(self._queue.get_nowait())
+                except queue.Empty:
+                    break
+            try:
+                self._pass(items, answer, torch)
+            except Exception:  # noqa: BLE001 — find whose row it was
+                # One caller's bad question must not fail the others it
+                # shared the pass with: answer each on its own, so only
+                # the owner of the bad row hears the error.
+                for item in items:
+                    try:
+                        self._pass([item], answer, torch)
+                    except Exception as error:  # noqa: BLE001
+                        item.loop.call_soon_threadsafe(_settle, item.future, None, error)
+
+    @staticmethod
+    def _pass(items: list[_Pending], answer, torch) -> None:
+        model = service.model
+        if model is None:
+            raise RuntimeError("The model is not ready.")
+        with torch.inference_mode():
+            batch = model.prepare([item.row for item in items])
+            distributions = (model(batch) / model.temperature).softmax(-1).cpu().tolist()
+        share = batch.input_tokens // max(len(items), 1)
+        results = [(answer(item.question, values[:count]), share)
+                   for item, values, count in zip(items, distributions, batch.counts, strict=True)]
+        for item, result in zip(items, results, strict=True):
+            item.loop.call_soon_threadsafe(_settle, item.future, result, None)
+
+
+def _settle(future: asyncio.Future, result, error: BaseException | None) -> None:
+    if future.done():
+        return
+    if error is not None:
+        future.set_exception(error)
+    else:
+        future.set_result(result)
+
+
+batcher = Batcher()
 
 
 class Question(BaseModel):
@@ -123,6 +218,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     service.name = f"autojev-{service.model.base_model.rsplit('/', 1)[-1].lower()}"
     modified = (Path(service.checkpoint) / "decision_config.json").stat().st_mtime
     service.release_date = datetime.fromtimestamp(modified, timezone.utc).date().isoformat()
+    batcher.start()
     try:
         yield
     finally:
@@ -193,17 +289,21 @@ def predict(model: DecisionModel, body: EvaluationRequest) -> DecisionResponse:
 
 @app.post("/v1/systemone", dependencies=[Depends(authenticate)], response_model=None)
 async def system_one(body: EvaluationRequest) -> DecisionResponse:
-    model = service.model
-    if model is None:
+    if service.model is None:
         raise HTTPException(503, "The model is not ready.")
-    if not service.lock.acquire(blocking=False):
+    questions = {key: cast(DecisionQuestion, question.model_dump(exclude_none=True))
+                 for key, question in body.questions.items()}
+    if batcher.waiting() + len(questions) > MAX_WAITING_ROWS:
         raise HTTPException(529, "The model is busy. Retry shortly.", headers={"Retry-After": "1"})
+    rows: list[DecisionInput] = [{"state": body.state, "question": question, "images": list(body.images)}
+                                 for question in questions.values()]
     try:
-        return await run_in_threadpool(predict, model, body)
+        results = await batcher.answer(rows, list(questions.values()))
     except ValueError as error:
         raise HTTPException(422, str(error)) from error
-    finally:
-        service.lock.release()
+    answers: dict[str, Answer] = {key: result for key, (result, _) in zip(questions, results, strict=True)}
+    input_tokens = sum(tokens for _, tokens in results)
+    return {"model": service.name, "answers": answers, "usage": {"input_tokens": input_tokens, "output_tokens": 0}}
 
 
 def main() -> None:
