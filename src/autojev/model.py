@@ -231,6 +231,11 @@ class DecisionModel(torch.nn.Module):
         for ids in sequences[1:]:
             shared = next((i for i in range(shared) if ids[i] != sequences[0][i]), shared)
         device = self.device_name
+        # The backbone keeps the position offsets of the last request that
+        # had images, and reads them back for any input with a cache: sized
+        # for that request's batch, they broke every shared read after it.
+        # Text has none to keep.
+        self.backbone.rope_deltas = None
         prefix = torch.tensor([sequences[0][:shared]], device=device)
         cache = self.backbone(input_ids=prefix, use_cache=True).past_key_values
         out: list[list[float]] = []
