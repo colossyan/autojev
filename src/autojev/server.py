@@ -41,6 +41,10 @@ ALIASES = {"autojev", "jev-latest", "jev-preview", "jev-1.13.0", DEFAULT_MODEL}
 # Rows per forward pass, as before; what changes is that a pass is filled from
 # every request waiting, not from one request while the rest are turned away.
 BATCH_ROWS = int(os.getenv("AUTOJEV_BATCH_ROWS", "8"))
+# Padded tokens one pass may hold: rows times the longest of them. A pass of
+# eight short questions and a pass of eight 7k-token plans are not the same
+# memory — the second ran the card out of memory mid-suite.
+BATCH_TOKENS = int(os.getenv("AUTOJEV_BATCH_TOKENS", "24576"))
 # Rows that may wait for a pass before a request is told the model is busy.
 MAX_WAITING_ROWS = int(os.getenv("AUTOJEV_MAX_WAITING_ROWS", "2048"))
 
@@ -63,6 +67,15 @@ class _Pending:
     question: DecisionQuestion
     loop: asyncio.AbstractEventLoop
     future: asyncio.Future
+    tokens: int = 0
+
+
+def _estimate_tokens(row: DecisionInput) -> int:
+    """Roughly the row's length in tokens, without tokenizing it: under three
+    characters a token on this text, so this errs long."""
+    import json
+
+    return len(json.dumps([row["state"], row["question"]], ensure_ascii=False)) * 10 // 26 + 256
 
 
 class Batcher:
@@ -88,7 +101,8 @@ class Batcher:
 
     async def answer(self, rows: list[DecisionInput], questions: list[DecisionQuestion]) -> list[tuple[Answer, int]]:
         loop = asyncio.get_running_loop()
-        pending = [_Pending(row, question, loop, loop.create_future()) for row, question in zip(rows, questions, strict=True)]
+        pending = [_Pending(row, question, loop, loop.create_future(), _estimate_tokens(row))
+                   for row, question in zip(rows, questions, strict=True)]
         for item in pending:
             self._queue.put(item)
         return list(await asyncio.gather(*(item.future for item in pending)))
@@ -97,24 +111,45 @@ class Batcher:
         import torch
         from autojev.model import answer
 
+        held: _Pending | None = None
         while True:
-            items = [self._queue.get()]
+            items = [held or self._queue.get()]
+            held = None
+            longest = items[0].tokens
             while len(items) < BATCH_ROWS:
                 try:
-                    items.append(self._queue.get_nowait())
+                    item = self._queue.get_nowait()
                 except queue.Empty:
                     break
-            try:
-                self._pass(items, answer, torch)
-            except Exception:  # noqa: BLE001 — find whose row it was
-                # One caller's bad question must not fail the others it
-                # shared the pass with: answer each on its own, so only
-                # the owner of the bad row hears the error.
-                for item in items:
-                    try:
-                        self._pass([item], answer, torch)
-                    except Exception as error:  # noqa: BLE001
-                        item.loop.call_soon_threadsafe(_settle, item.future, None, error)
+                if (len(items) + 1) * max(longest, item.tokens) > BATCH_TOKENS:
+                    held = item     # first in the next pass, so it keeps its turn
+                    break
+                items.append(item)
+                longest = max(longest, item.tokens)
+            self._answer(items, answer, torch)
+
+    def _answer(self, items: list[_Pending], answer, torch) -> None:
+        try:
+            self._pass(items, answer, torch)
+        except torch.cuda.OutOfMemoryError as error:
+            # Too much for one pass after all: halve it, down to one row,
+            # rather than fail every caller who shared it.
+            torch.cuda.empty_cache()
+            if len(items) == 1:
+                items[0].loop.call_soon_threadsafe(_settle, items[0].future, None, error)
+                return
+            half = len(items) // 2
+            self._answer(items[:half], answer, torch)
+            self._answer(items[half:], answer, torch)
+        except Exception:  # noqa: BLE001 — find whose row it was
+            # One caller's bad question must not fail the others it shared
+            # the pass with: answer each on its own, so only the owner of
+            # the bad row hears the error.
+            for item in items:
+                try:
+                    self._pass([item], answer, torch)
+                except Exception as error:  # noqa: BLE001
+                    item.loop.call_soon_threadsafe(_settle, item.future, None, error)
 
     @staticmethod
     def _pass(items: list[_Pending], answer, torch) -> None:
