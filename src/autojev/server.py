@@ -47,6 +47,11 @@ BATCH_ROWS = int(os.getenv("AUTOJEV_BATCH_ROWS", "8"))
 BATCH_TOKENS = int(os.getenv("AUTOJEV_BATCH_TOKENS", "24576"))
 # Rows that may wait for a pass before a request is told the model is busy.
 MAX_WAITING_ROWS = int(os.getenv("AUTOJEV_MAX_WAITING_ROWS", "2048"))
+# Fewer questions than this are read whole, beside other requests' rows: a
+# shared read is two passes (the state, then the questions), each paying the
+# fixed cost of a forward, and a request of two or three questions saved
+# less than that pass cost.
+SHARED_MIN_ROWS = int(os.getenv("AUTOJEV_SHARED_MIN_ROWS", "5"))
 
 
 @dataclass
@@ -113,7 +118,7 @@ class Batcher:
 
     async def answer(self, rows: list[DecisionInput], questions: list[DecisionQuestion]) -> list[tuple[Answer, int]]:
         loop = asyncio.get_running_loop()
-        if service.shared and len(rows) > 1 and not any(row.get("images") for row in rows):
+        if service.shared and len(rows) >= max(SHARED_MIN_ROWS, 2) and not any(row.get("images") for row in rows):
             job = _Shared(rows, questions, loop, loop.create_future())
             self._queue.put(job)  # type: ignore[arg-type]
             return await job.future
@@ -154,7 +159,7 @@ class Batcher:
             model = service.model
             if model is None:
                 raise RuntimeError("The model is not ready.")
-            distributions, read = model.shared_distributions(job.rows)
+            distributions, read = _profiled(lambda: model.shared_distributions(job.rows), torch)
             share = read // max(len(job.rows), 1)
             result = [(answer(q, values[:len(_options(q))]), share)
                       for q, values in zip(job.questions, distributions, strict=True)]
@@ -208,6 +213,31 @@ class Batcher:
                    for item, values, count in zip(items, distributions, batch.counts, strict=True)]
         for item, result in zip(items, results, strict=True):
             item.loop.call_soon_threadsafe(_settle, item.future, result, None)
+
+
+_profiled_seen = [0]
+
+
+def _profiled(run, torch):
+    """``run()``; with ``AUTOJEV_PROFILE_DIR`` set, requests 20 to 29 are
+    read under the torch profiler and its tables written there."""
+    import os
+
+    out = os.getenv("AUTOJEV_PROFILE_DIR")
+    _profiled_seen[0] += 1
+    if not out or not 20 <= _profiled_seen[0] < 30:
+        return run()
+    from torch.profiler import ProfilerActivity, profile
+
+    with profile(activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA]) as prof:
+        result = run()
+        torch.cuda.synchronize()
+    n = _profiled_seen[0]
+    with open(os.path.join(out, f"profile_{n}.txt"), "w") as f:
+        f.write(prof.key_averages().table(sort_by="cuda_time_total", row_limit=40))
+        f.write("\n\n")
+        f.write(prof.key_averages().table(sort_by="cpu_time_total", row_limit=40))
+    return result
 
 
 def _options(question: DecisionQuestion) -> list:

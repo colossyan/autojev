@@ -112,7 +112,7 @@ def open_image(value: ImageInput) -> Image.Image:
 
 
 # Questions answered together off one shared state.
-_BRANCH_BATCH = 16
+_BRANCH_BATCH = int(os.getenv("AUTOJEV_BRANCH_BATCH", "16"))
 # Questions of one kind open on the same rules (a plan's "which output does
 # this scene take from that one", one per pair of scenes): a group whose
 # common opening runs this far past the shared state is read once more for
