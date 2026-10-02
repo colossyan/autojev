@@ -302,6 +302,9 @@ def _shared_matches(model: DecisionModel) -> bool:
         jobs.append((rows, whole, batch.counts))
     # Read together, the requests' questions share batches over a cache
     # merged from states of different lengths: the same answers again.
+    # From nothing kept, so the states of different lengths are read in one
+    # left-padded pass as well.
+    model.__dict__.get("_kept", {}).clear()
     together = model.shared_distributions_many([rows for rows, _, _ in jobs])
     for (_, whole, counts), (shared, _) in zip(jobs, together, strict=True):
         worst = max(worst, max(abs(a - b) for w, sh, c in zip(whole, shared, counts)

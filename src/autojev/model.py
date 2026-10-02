@@ -249,7 +249,31 @@ class DecisionModel(torch.nn.Module):
         return PreparedBatch({name: tensor.to(self.device_name) for name, tensor in inputs.items()}, tuple(counts), tokens)
 
     @torch.inference_mode()
-    def _sources(self, rows: Sequence[DecisionInput], max_length: int, marks: list
+    def _tokenized(self, rows: Sequence[DecisionInput], max_length: int
+                   ) -> tuple[list[int], list[list[int]], int]:
+        """Each row's option count and tokens, and how many tokens they all
+        open with (every row keeps at least one of its own)."""
+        if not rows or any(row.get("images") for row in rows):
+            raise ValueError("Shared reading is for text rows only.")
+        counts: list[int] = []
+        sequences: list[list[int]] = []
+        for row in rows:
+            counts.append(len(options(row["question"])[0]))
+            text = self.processor.apply_chat_template(
+                decision_messages(row, self.codes), tokenize=False,
+                add_generation_prompt=True, enable_thinking=False,  # type: ignore[arg-type]
+            )
+            ids = cast(list[int], self.processor.tokenizer(text, add_special_tokens=False)["input_ids"])
+            if len(ids) > max_length:
+                raise ValueError(f"Question branch exceeds the {max_length}-token limit; no input was truncated.")
+            sequences.append(ids)
+        shared = min(len(ids) for ids in sequences) - 1
+        for ids in sequences[1:]:
+            shared = next((i for i in range(shared) if ids[i] != sequences[0][i]), shared)
+        return counts, sequences, shared
+
+    def _sources(self, rows: Sequence[DecisionInput], max_length: int, marks: list,
+                 tokenized: tuple[list[int], list[list[int]], int] | None = None,
                  ) -> tuple[list[list[int]], list[int], list[tuple[Any, int, list[int]]], int]:
         """Each row's answer distribution, reading what the rows share once.
 
@@ -266,23 +290,8 @@ class DecisionModel(torch.nn.Module):
         import os
         import time as _time
         timing = os.getenv("AUTOJEV_TIMING") == "1"
-        counts: list[int] = []
-        sequences: list[list[int]] = []
-        for row in rows:
-            counts.append(len(options(row["question"])[0]))
-            text = self.processor.apply_chat_template(
-                decision_messages(row, self.codes), tokenize=False,
-                add_generation_prompt=True, enable_thinking=False,  # type: ignore[arg-type]
-            )
-            ids = cast(list[int], self.processor.tokenizer(text, add_special_tokens=False)["input_ids"])
-            if len(ids) > max_length:
-                raise ValueError(f"Question branch exceeds the {max_length}-token limit; no input was truncated.")
-            sequences.append(ids)
+        counts, sequences, shared = tokenized or self._tokenized(rows, max_length)
         marks.append(("tokenize", _time.perf_counter()))
-        # Every row keeps at least one token of its own to read past the cache.
-        shared = min(len(ids) for ids in sequences) - 1
-        for ids in sequences[1:]:
-            shared = next((i for i in range(shared) if ids[i] != sequences[0][i]), shared)
         device = self.device_name
         # The backbone keeps the position offsets of the last request that
         # had images, and reads them back for any input with a cache: sized
@@ -344,7 +353,11 @@ class DecisionModel(torch.nn.Module):
         timing = os.getenv("AUTOJEV_TIMING") == "1"
         marks = [("start", _time.perf_counter())]
         device = self.device_name
-        prepared = [self._sources(rows, max_length, marks) for rows in jobs]
+        tokenized = [self._tokenized(rows, max_length) for rows in jobs]
+        self.backbone.rope_deltas = None
+        self._warm([seqs[0][:shared] for _, seqs, shared in tokenized], device)
+        marks.append(("warm", _time.perf_counter()))
+        prepared = [self._sources(rows, max_length, marks, tok) for rows, tok in zip(jobs, tokenized)]
         entries = [(j, i, cache, base)
                    for j, (_, _, sources, _) in enumerate(prepared)
                    for cache, base, members in sources for i in members]
@@ -395,6 +408,57 @@ class DecisionModel(torch.nn.Module):
             mine = sum(len(sequences[i]) - b for jj, i, _, b in entries if jj == j)
             out.append(([answered[(j, i)] for i in range(len(sequences))], read + mine))
         return out
+
+    def _warm(self, prefixes: Sequence[list[int]], device) -> None:
+        """Read the states nothing kept opens, together: left-padded into one
+        pass (the padding is masked, and the recurrent layers start from
+        zero, which zeroed padding leaves them at), then kept one by one as
+        their own reads, for ``_prefix`` to find."""
+        import copy
+        from collections import OrderedDict
+
+        kept: OrderedDict = self.__dict__.setdefault("_kept", OrderedDict())
+        cold: list[list[int]] = []
+        for ids in prefixes:
+            key = tuple(ids)
+            if len(key) < _PREFIX_MIN or key in {tuple(c) for c in cold}:
+                continue
+            if any(len(k) <= len(key) and key[:len(k)] == k for k in kept):
+                continue
+            cold.append(ids)
+        if len(cold) < 2:
+            return
+        longest = max(len(ids) for ids in cold)
+        pad = self.processor.tokenizer.pad_token_id or 0
+        tokens = torch.tensor([[pad] * (longest - len(ids)) + ids for ids in cold], device=device)
+        mask = torch.tensor([[0] * (longest - len(ids)) + [1] * len(ids) for ids in cold], device=device)
+        positions = torch.tensor([[max(0, k - (longest - len(ids))) for k in range(longest)] for ids in cold],
+                                 device=device)
+        batched = self.backbone(input_ids=tokens, attention_mask=mask, position_ids=positions,
+                                use_cache=True).past_key_values
+        for r, ids in enumerate(cold):
+            one = copy.copy(batched)
+            one.layers = []
+            for layer in batched.layers:
+                new = copy.copy(layer)
+                keys = getattr(layer, "keys", None)
+                if isinstance(keys, torch.Tensor) and keys.numel():
+                    new.keys = layer.keys[r:r + 1, :, longest - len(ids):, :].contiguous()
+                    new.values = layer.values[r:r + 1, :, longest - len(ids):, :].contiguous()
+                for name in ("conv_states", "recurrent_states"):
+                    states = getattr(layer, name, None)
+                    if isinstance(states, dict):
+                        setattr(new, name, {k: (v[r:r + 1].clone() if v is not None else None)
+                                            for k, v in states.items()})
+                for name in ("is_conv_states_initialized", "is_recurrent_states_initialized",
+                             "has_previous_state"):
+                    if isinstance(getattr(layer, name, None), dict):
+                        setattr(new, name, dict(getattr(layer, name)))
+                one.layers.append(new)
+            kept[tuple(ids)] = one
+        while kept and (len(kept) > _PREFIX_ENTRIES
+                        or sum(len(k) for k in kept) > _PREFIX_TOKENS):
+            kept.popitem(last=False)
 
     def _prefix(self, ids: list[int], device) -> tuple[Any, int]:
         """The cache of reading ``ids``, and how many of them were already
