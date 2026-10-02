@@ -52,6 +52,10 @@ MAX_WAITING_ROWS = int(os.getenv("AUTOJEV_MAX_WAITING_ROWS", "2048"))
 # fixed cost of a forward, and a request of two or three questions saved
 # less than that pass cost.
 SHARED_MIN_ROWS = int(os.getenv("AUTOJEV_SHARED_MIN_ROWS", "5"))
+# Shared requests waiting together are read together, up to this many
+# requests and questions: their questions fill common batches.
+SHARED_JOBS = int(os.getenv("AUTOJEV_SHARED_JOBS", "8"))
+SHARED_ROWS = int(os.getenv("AUTOJEV_SHARED_ROWS", "160"))
 
 
 @dataclass
@@ -137,7 +141,17 @@ class Batcher:
             first = held or self._queue.get()
             held = None
             if isinstance(first, _Shared):
-                self._shared(first, answer, torch)
+                jobs = [first]
+                rows = len(first.rows)
+                # The shared requests queued right behind it are read with it.
+                with self._queue.mutex:
+                    waiting = self._queue.queue
+                    while (waiting and isinstance(waiting[0], _Shared) and len(jobs) < SHARED_JOBS
+                           and rows + len(waiting[0].rows) <= SHARED_ROWS):
+                        job = waiting.popleft()
+                        jobs.append(job)
+                        rows += len(job.rows)
+                self._shared(jobs, answer, torch)
                 continue
             items = [first]
             longest = items[0].tokens
@@ -154,21 +168,27 @@ class Batcher:
             self._answer(items, answer, torch)
 
     @staticmethod
-    def _shared(job: _Shared, answer, torch) -> None:
+    def _shared(jobs: list[_Shared], answer, torch) -> None:
         try:
             model = service.model
             if model is None:
                 raise RuntimeError("The model is not ready.")
-            distributions, read = _profiled(lambda: model.shared_distributions(job.rows), torch)
-            share = read // max(len(job.rows), 1)
-            result = [(answer(q, values[:len(_options(q))]), share)
-                      for q, values in zip(job.questions, distributions, strict=True)]
+            read_all = _profiled(lambda: model.shared_distributions_many([job.rows for job in jobs]), torch)
         except Exception as error:  # noqa: BLE001
             if isinstance(error, torch.cuda.OutOfMemoryError):
                 torch.cuda.empty_cache()
-            job.loop.call_soon_threadsafe(_settle, job.future, None, error)
+            for job in jobs:
+                job.loop.call_soon_threadsafe(_settle, job.future, None, error)
             return
-        job.loop.call_soon_threadsafe(_settle, job.future, result, None)
+        for job, (distributions, read) in zip(jobs, read_all, strict=True):
+            try:
+                share = read // max(len(job.rows), 1)
+                result = [(answer(q, values[:len(_options(q))]), share)
+                          for q, values in zip(job.questions, distributions, strict=True)]
+            except Exception as error:  # noqa: BLE001
+                job.loop.call_soon_threadsafe(_settle, job.future, None, error)
+                continue
+            job.loop.call_soon_threadsafe(_settle, job.future, result, None)
 
     def _answer(self, items: list[_Pending], answer, torch) -> None:
         try:
@@ -267,6 +287,7 @@ def _shared_matches(model: DecisionModel) -> bool:
           for n in (2, 3)),
     ]
     worst = 0.0
+    jobs: list = []
     # Read cold; then read on from what the first kept (a longer state that
     # opens the same way); then the same again, wholly from what was kept.
     for told in (state, state + " The dashboard shows revenue by quarter.",
@@ -277,6 +298,13 @@ def _shared_matches(model: DecisionModel) -> bool:
             whole = (model(batch) / model.temperature).softmax(-1).cpu().tolist()
         shared, _ = model.shared_distributions(rows)
         worst = max(worst, max(abs(a - b) for w, sh, c in zip(whole, shared, batch.counts)
+                               for a, b in zip(w[:c], sh[:c])))
+        jobs.append((rows, whole, batch.counts))
+    # Read together, the requests' questions share batches over a cache
+    # merged from states of different lengths: the same answers again.
+    together = model.shared_distributions_many([rows for rows, _, _ in jobs])
+    for (_, whole, counts), (shared, _) in zip(jobs, together, strict=True):
+        worst = max(worst, max(abs(a - b) for w, sh, c in zip(whole, shared, counts)
                                for a, b in zip(w[:c], sh[:c])))
     print(f"autojev: shared-state reading differs by at most {worst:.4f} from the whole read", flush=True)
     return worst < 0.02

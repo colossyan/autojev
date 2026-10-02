@@ -101,6 +101,37 @@ def answer(question: Question, probabilities: Sequence[float]) -> Answer:
             "confidence": max(0.0, 1.0 - distance / baseline)}
 
 
+def _merged(caches: Sequence[Any], length: int) -> Any:
+    """One batched cache of single-row ``caches`` read to different lengths:
+    each attention layer's keys and values left-padded to ``length`` (the
+    padding is masked out), each recurrent layer's states side by side. The
+    caches given are left as they were."""
+    import copy
+
+    import torch.nn.functional as F
+
+    merged = copy.copy(caches[0])
+    merged.layers = []
+    for n, layer in enumerate(caches[0].layers):
+        mine = [c.layers[n] for c in caches]
+        new = copy.copy(layer)
+        keys = getattr(layer, "keys", None)
+        if isinstance(keys, torch.Tensor) and keys.numel():
+            new.keys = torch.cat([F.pad(m.keys, (0, 0, length - m.keys.shape[-2], 0)) for m in mine])
+            new.values = torch.cat([F.pad(m.values, (0, 0, length - m.values.shape[-2], 0)) for m in mine])
+        for name in ("conv_states", "recurrent_states"):
+            states = getattr(layer, name, None)
+            if isinstance(states, dict):
+                setattr(new, name, {k: (torch.cat([getattr(m, name)[k] for m in mine])
+                                        if v is not None else None) for k, v in states.items()})
+        for name in ("is_conv_states_initialized", "is_recurrent_states_initialized",
+                     "has_previous_state"):
+            if isinstance(getattr(layer, name, None), dict):
+                setattr(new, name, dict(getattr(layer, name)))
+        merged.layers.append(new)
+    return merged
+
+
 def open_image(value: ImageInput) -> Image.Image:
     if isinstance(value, Image.Image):
         return value.convert("RGB")
@@ -218,8 +249,8 @@ class DecisionModel(torch.nn.Module):
         return PreparedBatch({name: tensor.to(self.device_name) for name, tensor in inputs.items()}, tuple(counts), tokens)
 
     @torch.inference_mode()
-    def shared_distributions(self, rows: Sequence[DecisionInput], max_length: int = 8192
-                             ) -> tuple[list[list[float]], int]:
+    def _sources(self, rows: Sequence[DecisionInput], max_length: int, marks: list
+                 ) -> tuple[list[list[int]], list[int], list[tuple[Any, int, list[int]]], int]:
         """Each row's answer distribution, reading what the rows share once.
 
         A request's questions all open on the same state, so the tokens before
@@ -235,7 +266,6 @@ class DecisionModel(torch.nn.Module):
         import os
         import time as _time
         timing = os.getenv("AUTOJEV_TIMING") == "1"
-        marks = [("start", _time.perf_counter())]
         counts: list[int] = []
         sequences: list[list[int]] = []
         for row in rows:
@@ -291,42 +321,80 @@ class DecisionModel(torch.nn.Module):
         if timing:
             torch.cuda.synchronize()
         marks.append((f"trunks {len(trunks)}", _time.perf_counter()))
-        answered: dict[int, list[float]] = {}
-        # The questions in batches over one expanded copy of a cache, each
-        # right-padded and read at its own last token: one at a time, a
-        # plan's thirty questions kept the GPU idle between short passes, and
-        # sixteen plans at once queued behind each other for a minute.
+        return sequences, counts, trunks, read
+
+    @torch.inference_mode()
+    def shared_distributions(self, rows: Sequence[DecisionInput], max_length: int = 8192
+                             ) -> tuple[list[list[float]], int]:
+        """``shared_distributions_many`` for one request."""
+        return self.shared_distributions_many([rows], max_length)[0]
+
+    @torch.inference_mode()
+    def shared_distributions_many(self, jobs: Sequence[Sequence[DecisionInput]], max_length: int = 8192
+                                  ) -> list[tuple[list[list[float]], int]]:
+        """Each request's answer distributions and tokens read, several
+        requests read together: each one's shared state once (as
+        ``_sources``), then every request's questions in common batches.
+        One request at a time, a three-question plan step paid a whole
+        forward's fixed cost for three short rows while a dozen others
+        waited behind it."""
+        import copy
+        import os
+        import time as _time
+        timing = os.getenv("AUTOJEV_TIMING") == "1"
+        marks = [("start", _time.perf_counter())]
+        device = self.device_name
+        prepared = [self._sources(rows, max_length, marks) for rows in jobs]
+        entries = [(j, i, cache, base)
+                   for j, (_, _, sources, _) in enumerate(prepared)
+                   for cache, base, members in sources for i in members]
         # Batched by length, so a short yes/no is not padded to the longest
         # choice beside it; answered back in the order asked.
-        for trunk, base, members in trunks:
-            members = sorted(members, key=lambda i: len(sequences[i]))
-            for start in range(0, len(members), _BRANCH_BATCH):
-                chunk = members[start:start + _BRANCH_BATCH]
-                tails = [sequences[i][base:] for i in chunk]
-                width = max(len(t) for t in tails)
-                pad = self.processor.tokenizer.pad_token_id or 0
-                branch = torch.tensor([t + [pad] * (width - len(t)) for t in tails], device=device)
+        entries.sort(key=lambda e: len(prepared[e[0]][0][e[1]]) - e[3])
+        answered: dict[tuple[int, int], list[float]] = {}
+        branch_read = 0
+        pad = self.processor.tokenizer.pad_token_id or 0
+        for start in range(0, len(entries), _BRANCH_BATCH):
+            chunk = entries[start:start + _BRANCH_BATCH]
+            tails = [prepared[j][0][i][base:] for j, i, _, base in chunk]
+            width = max(len(t) for t in tails)
+            branch = torch.tensor([t + [pad] * (width - len(t)) for t in tails], device=device)
+            caches = [c for _, _, c, _ in chunk]
+            if all(c is caches[0] for c in caches):
+                base = chunk[0][3]
                 mask = torch.tensor([[1] * base + [1] * len(t) + [0] * (width - len(t)) for t in tails],
                                     device=device)
-                batch_cache = copy.deepcopy(trunk)
+                batch_cache = copy.deepcopy(caches[0])
                 batch_cache.reorder_cache(torch.zeros(len(chunk), dtype=torch.long, device=device))
                 hidden = self.backbone(input_ids=branch, attention_mask=mask,
                                        past_key_values=batch_cache, use_cache=True).last_hidden_state
-                last = torch.tensor([len(t) - 1 for t in tails], device=device)
-                picked = hidden[torch.arange(len(chunk), device=device), last]
-                logits = self.readout(picked).float()
-                for row, i in enumerate(chunk):
-                    row_logits = logits[row].clone()
-                    row_logits[counts[i]:] = -1e9
-                    answered[i] = (row_logits / self.temperature).softmax(-1).cpu().tolist()
-                read += sum(len(t) for t in tails)
-                marks.append((f"batch {len(chunk)}x{width}t", _time.perf_counter()))
-        out = [answered[i] for i in range(len(sequences))]
+            else:
+                bases = [b for _, _, _, b in chunk]
+                longest = max(bases)
+                mask = torch.tensor([[0] * (longest - b) + [1] * b + [1] * len(t) + [0] * (width - len(t))
+                                     for b, t in zip(bases, tails)], device=device)
+                positions = torch.tensor([[b + k for k in range(width)] for b in bases], device=device)
+                hidden = self.backbone(input_ids=branch, attention_mask=mask, position_ids=positions,
+                                       past_key_values=_merged(caches, longest),
+                                       use_cache=True).last_hidden_state
+            last = torch.tensor([len(t) - 1 for t in tails], device=device)
+            picked = hidden[torch.arange(len(chunk), device=device), last]
+            logits = self.readout(picked).float()
+            for row, (j, i, _, _) in enumerate(chunk):
+                row_logits = logits[row].clone()
+                row_logits[prepared[j][1][i]:] = -1e9
+                answered[(j, i)] = (row_logits / self.temperature).softmax(-1).cpu().tolist()
+            branch_read += sum(len(t) for t in tails)
+            marks.append((f"batch {len(chunk)}x{width}t", _time.perf_counter()))
         if timing:
-            print("autojev timing: " + " ".join(
-                f"{name}={(t - marks[i][1]) * 1000:.0f}ms" for i, (name, t) in enumerate(marks[1:])),
+            print(f"autojev timing: jobs={len(jobs)} " + " ".join(
+                f"{name}={(t - marks[k][1]) * 1000:.0f}ms" for k, (name, t) in enumerate(marks[1:])),
                 flush=True)
-        return out, read
+        out = []
+        for j, (sequences, _, _, read) in enumerate(prepared):
+            mine = sum(len(sequences[i]) - b for jj, i, _, b in entries if jj == j)
+            out.append(([answered[(j, i)] for i in range(len(sequences))], read + mine))
+        return out
 
     def _prefix(self, ids: list[int], device) -> tuple[Any, int]:
         """The cache of reading ``ids``, and how many of them were already
