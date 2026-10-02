@@ -54,10 +54,10 @@ MAX_WAITING_ROWS = int(os.getenv("AUTOJEV_MAX_WAITING_ROWS", "2048"))
 SHARED_MIN_ROWS = int(os.getenv("AUTOJEV_SHARED_MIN_ROWS", "5"))
 # Shared requests waiting together are read together, up to this many
 # requests and questions: their questions fill common batches.
-SHARED_JOBS = int(os.getenv("AUTOJEV_SHARED_JOBS", "8"))
-SHARED_ROWS = int(os.getenv("AUTOJEV_SHARED_ROWS", "160"))
+SHARED_JOBS = int(os.getenv("AUTOJEV_SHARED_JOBS", "4"))
+SHARED_ROWS = int(os.getenv("AUTOJEV_SHARED_ROWS", "96"))
 # Bytes of GPU memory the allocator may keep reserved between requests.
-RESERVED_CAP = int(float(os.getenv("AUTOJEV_RESERVED_CAP_GB", "60")) * 2**30)
+RESERVED_CAP = int(float(os.getenv("AUTOJEV_RESERVED_CAP_GB", "56")) * 2**30)
 
 
 @dataclass
@@ -175,7 +175,15 @@ class Batcher:
             model = service.model
             if model is None:
                 raise RuntimeError("The model is not ready.")
-            read_all = _profiled(lambda: model.shared_distributions_many([job.rows for job in jobs]), torch)
+            try:
+                read_all = _profiled(lambda: model.shared_distributions_many([job.rows for job in jobs]), torch)
+            except torch.cuda.OutOfMemoryError:
+                # Read together they did not fit beside the GPU's other
+                # tenants; one at a time they do, and nobody gets an error.
+                if len(jobs) == 1:
+                    raise
+                torch.cuda.empty_cache()
+                read_all = [model.shared_distributions(job.rows) for job in jobs]
             # Batched reads of many states leave the allocator holding blocks
             # sized for them; past this, give them back rather than keep a
             # GPU shared with other services at its high-water mark.
