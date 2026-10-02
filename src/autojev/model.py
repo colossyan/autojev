@@ -5,6 +5,7 @@ import io
 import itertools
 import json
 import math
+import os
 import string
 from collections.abc import Sequence
 from dataclasses import dataclass
@@ -118,6 +119,13 @@ _BRANCH_BATCH = 16
 # the group, when that saves at least _GROUP_MIN_GAIN tokens.
 _GROUP_KEY = 32
 _GROUP_MIN_GAIN = 256
+# Shared states read before, kept to be read on from: a plan's requests open
+# on the same request and plan, round after round. Bounded by entries and by
+# the tokens they hold (a few thousand tokens of cache is tens of MB).
+_PREFIX_ENTRIES = int(os.getenv("AUTOJEV_PREFIX_ENTRIES", "64"))
+_PREFIX_TOKENS = int(os.getenv("AUTOJEV_PREFIX_TOKENS", "131072"))
+# A cached prefix shorter than this is not worth looking up and keeping.
+_PREFIX_MIN = 64
 
 
 class DecisionModel(torch.nn.Module):
@@ -251,12 +259,23 @@ class DecisionModel(torch.nn.Module):
         # for that request's batch, they broke every shared read after it.
         # Text has none to keep.
         self.backbone.rope_deltas = None
-        prefix = torch.tensor([sequences[0][:shared]], device=device)
-        cache = self.backbone(input_ids=prefix, use_cache=True).past_key_values
+        # Where the state ends in the rows: what a later request on the same
+        # state reads on from, whatever its questions open with.
+        first = self.processor.apply_chat_template(
+            decision_messages(rows[0], self.codes), tokenize=False,
+            add_generation_prompt=True, enable_thinking=False,  # type: ignore[arg-type]
+        )
+        cut = first.find("\n\nQuestion:\n")
+        state_end = 0
+        if cut > 0:
+            head = cast(list[int], self.processor.tokenizer(first[:cut], add_special_tokens=False)["input_ids"])
+            if sequences[0][:len(head)] == head and len(head) <= shared:
+                state_end = len(head)
+        cache, known = self._prefix(sequences[0][:shared], device, state_end)
         if timing:
             torch.cuda.synchronize()
-        marks.append((f"prefix {shared}t", _time.perf_counter()))
-        read = shared
+        marks.append((f"prefix {shared}t ({known} known)", _time.perf_counter()))
+        read = shared - known
         # Rows whose opening runs on together past the shared state, read
         # once more from the shared cache; every other row branches off it.
         groups: dict[tuple[int, ...], list[int]] = {}
@@ -320,6 +339,47 @@ class DecisionModel(torch.nn.Module):
                 f"{name}={(t - marks[i][1]) * 1000:.0f}ms" for i, (name, t) in enumerate(marks[1:])),
                 flush=True)
         return out, read
+
+    def _prefix(self, ids: list[int], device, state_end: int = 0) -> tuple[Any, int]:
+        """The cache of reading ``ids``, and how many of them were already
+        read: from the longest kept prefix of them, extended by the rest.
+        Kept at the end of the state as well as at the end of ``ids``: a
+        later request on the same state opens its questions differently.
+        A kept cache is never written to — what extends it is a copy."""
+        from collections import OrderedDict
+
+        kept: OrderedDict = self.__dict__.setdefault("_kept", OrderedDict())
+        key = tuple(ids)
+        best: tuple[int, ...] = ()
+        for k in kept:
+            if len(best) < len(k) <= len(key) and key[:len(k)] == k:
+                best = k
+        known = len(best)
+        cache = kept[best] if best else None
+        if best:
+            kept.move_to_end(best)
+        for stop in sorted({state_end, len(key)}):
+            if stop <= len(best) or stop < _PREFIX_MIN and stop != len(key):
+                continue
+            cache = self._read_on(cache, ids[len(best):stop], device)
+            best = key[:stop]
+            if stop >= _PREFIX_MIN:
+                kept[best] = cache
+        while kept and (len(kept) > _PREFIX_ENTRIES
+                        or sum(len(k) for k in kept) > _PREFIX_TOKENS):
+            kept.popitem(last=False)
+        return cache, known
+
+    def _read_on(self, cache, ids: list[int], device):
+        """``cache`` (None: nothing yet) with ``ids`` read after it, as a new
+        cache — the one given is left as it was."""
+        import copy
+
+        tokens = torch.tensor([ids], device=device)
+        if cache is None:
+            return self.backbone(input_ids=tokens, use_cache=True).past_key_values
+        return self.backbone(input_ids=tokens, past_key_values=copy.deepcopy(cache),
+                             use_cache=True).past_key_values
 
     def forward(self, batch: PreparedBatch) -> torch.Tensor:
         hidden: torch.Tensor = self.backbone(**batch.inputs, use_cache=False).last_hidden_state[:, -1]

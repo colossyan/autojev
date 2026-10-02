@@ -236,13 +236,18 @@ def _shared_matches(model: DecisionModel) -> bool:
            "criteria": {"frame": "its start image", "audio": "its narration", "none": "nothing"}}
           for n in (2, 3)),
     ]
-    rows: list[DecisionInput] = [{"state": state, "question": q, "images": []} for q in questions]
-    with torch.inference_mode():
-        batch = model.prepare(rows)
-        whole = (model(batch) / model.temperature).softmax(-1).cpu().tolist()
-    shared, _ = model.shared_distributions(rows)
-    worst = max(abs(a - b) for w, sh, c in zip(whole, shared, batch.counts)
-                for a, b in zip(w[:c], sh[:c]))
+    worst = 0.0
+    # Read cold; then read on from what the first kept (a longer state that
+    # opens the same way); then the same again, wholly from what was kept.
+    for told in (state, state + " The dashboard shows revenue by quarter.",
+                 state + " The dashboard shows revenue by quarter."):
+        rows: list[DecisionInput] = [{"state": told, "question": q, "images": []} for q in questions]
+        with torch.inference_mode():
+            batch = model.prepare(rows)
+            whole = (model(batch) / model.temperature).softmax(-1).cpu().tolist()
+        shared, _ = model.shared_distributions(rows)
+        worst = max(worst, max(abs(a - b) for w, sh, c in zip(whole, shared, batch.counts)
+                               for a, b in zip(w[:c], sh[:c])))
     print(f"autojev: shared-state reading differs by at most {worst:.4f} from the whole read", flush=True)
     return worst < 0.02
 
