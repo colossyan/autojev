@@ -56,6 +56,8 @@ SHARED_MIN_ROWS = int(os.getenv("AUTOJEV_SHARED_MIN_ROWS", "5"))
 # requests and questions: their questions fill common batches.
 SHARED_JOBS = int(os.getenv("AUTOJEV_SHARED_JOBS", "8"))
 SHARED_ROWS = int(os.getenv("AUTOJEV_SHARED_ROWS", "160"))
+# Bytes of GPU memory the allocator may keep reserved between requests.
+RESERVED_CAP = int(float(os.getenv("AUTOJEV_RESERVED_CAP_GB", "60")) * 2**30)
 
 
 @dataclass
@@ -174,6 +176,11 @@ class Batcher:
             if model is None:
                 raise RuntimeError("The model is not ready.")
             read_all = _profiled(lambda: model.shared_distributions_many([job.rows for job in jobs]), torch)
+            # Batched reads of many states leave the allocator holding blocks
+            # sized for them; past this, give them back rather than keep a
+            # GPU shared with other services at its high-water mark.
+            if torch.cuda.is_available() and torch.cuda.memory_reserved() > RESERVED_CAP:
+                torch.cuda.empty_cache()
         except Exception as error:  # noqa: BLE001
             if isinstance(error, torch.cuda.OutOfMemoryError):
                 torch.cuda.empty_cache()
