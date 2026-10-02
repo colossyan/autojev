@@ -110,6 +110,10 @@ def open_image(value: ImageInput) -> Image.Image:
         return image.convert("RGB")
 
 
+# Questions answered together off one shared state.
+_BRANCH_BATCH = 16
+
+
 class DecisionModel(torch.nn.Module):
     def __init__(
         self, checkpoint: str | Path | None = None, train: bool = False, device: str | None = None,
@@ -240,14 +244,31 @@ class DecisionModel(torch.nn.Module):
         cache = self.backbone(input_ids=prefix, use_cache=True).past_key_values
         out: list[list[float]] = []
         read = shared
-        for ids, count in zip(sequences, counts, strict=True):
-            branch = torch.tensor([ids[shared:]], device=device)
-            hidden = self.backbone(input_ids=branch, past_key_values=copy.deepcopy(cache),
-                                   use_cache=True).last_hidden_state[:, -1]
-            logits = self.readout(hidden).float()[0]
-            logits[count:] = -1e9
-            out.append((logits / self.temperature).softmax(-1).cpu().tolist())
-            read += len(ids) - shared
+        # The questions in batches over one expanded copy of the cache, each
+        # right-padded and read at its own last token: one at a time, a
+        # plan's thirty questions kept the GPU idle between short passes, and
+        # sixteen plans at once queued behind each other for a minute.
+        rows = list(zip(sequences, counts, strict=True))
+        for start in range(0, len(rows), _BRANCH_BATCH):
+            chunk = rows[start:start + _BRANCH_BATCH]
+            tails = [ids[shared:] for ids, _ in chunk]
+            width = max(len(t) for t in tails)
+            pad = self.processor.tokenizer.pad_token_id or 0
+            branch = torch.tensor([t + [pad] * (width - len(t)) for t in tails], device=device)
+            mask = torch.tensor([[1] * shared + [1] * len(t) + [0] * (width - len(t)) for t in tails],
+                                device=device)
+            batch_cache = copy.deepcopy(cache)
+            batch_cache.reorder_cache(torch.zeros(len(chunk), dtype=torch.long, device=device))
+            hidden = self.backbone(input_ids=branch, attention_mask=mask,
+                                   past_key_values=batch_cache, use_cache=True).last_hidden_state
+            last = torch.tensor([len(t) - 1 for t in tails], device=device)
+            picked = hidden[torch.arange(len(chunk), device=device), last]
+            logits = self.readout(picked).float()
+            for row, (_, count) in enumerate(chunk):
+                row_logits = logits[row].clone()
+                row_logits[count:] = -1e9
+                out.append((row_logits / self.temperature).softmax(-1).cpu().tolist())
+            read += sum(len(t) for t in tails)
         return out, read
 
     def forward(self, batch: PreparedBatch) -> torch.Tensor:
