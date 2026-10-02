@@ -193,9 +193,16 @@ class Batcher:
         model = service.model
         if model is None:
             raise RuntimeError("The model is not ready.")
+        import os
+        import time as _time
+        started = _time.perf_counter()
         with torch.inference_mode():
             batch = model.prepare([item.row for item in items])
             distributions = (model(batch) / model.temperature).softmax(-1).cpu().tolist()
+        if os.getenv("AUTOJEV_TIMING") == "1":
+            images = sum(len(item.row.get("images") or ()) for item in items)
+            print(f"autojev timing: pass {len(items)} rows {batch.input_tokens}t "
+                  f"{images} images={(_time.perf_counter() - started) * 1000:.0f}ms", flush=True)
         share = batch.input_tokens // max(len(items), 1)
         results = [(answer(item.question, values[:count]), share)
                    for item, values, count in zip(items, distributions, batch.counts, strict=True)]
@@ -222,6 +229,12 @@ def _shared_matches(model: DecisionModel) -> bool:
         {"type": "choice", "instructions": "Which canvas?",
          "criteria": {"wide": "16:9", "tall": "9:16", "square": "1:1"}},
         {"type": "noul", "instructions": "Is there background music?"},
+        # Two of one kind, opening on the same rules: read through a group's
+        # own longer prefix, which has to answer as the whole read too.
+        *({"type": "choice", "instructions": "Below is every scene in one video. " * 40
+           + f"Which output does scene {n} take from the first scene?",
+           "criteria": {"frame": "its start image", "audio": "its narration", "none": "nothing"}}
+          for n in (2, 3)),
     ]
     rows: list[DecisionInput] = [{"state": state, "question": q, "images": []} for q in questions]
     with torch.inference_mode():
