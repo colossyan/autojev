@@ -218,6 +218,10 @@ class DecisionModel(torch.nn.Module):
 
         if not rows or any(row.get("images") for row in rows):
             raise ValueError("Shared reading is for text rows only.")
+        import os
+        import time as _time
+        timing = os.getenv("AUTOJEV_TIMING") == "1"
+        marks = [("start", _time.perf_counter())]
         counts: list[int] = []
         sequences: list[list[int]] = []
         for row in rows:
@@ -230,6 +234,7 @@ class DecisionModel(torch.nn.Module):
             if len(ids) > max_length:
                 raise ValueError(f"Question branch exceeds the {max_length}-token limit; no input was truncated.")
             sequences.append(ids)
+        marks.append(("tokenize", _time.perf_counter()))
         # Every row keeps at least one token of its own to read past the cache.
         shared = min(len(ids) for ids in sequences) - 1
         for ids in sequences[1:]:
@@ -242,13 +247,19 @@ class DecisionModel(torch.nn.Module):
         self.backbone.rope_deltas = None
         prefix = torch.tensor([sequences[0][:shared]], device=device)
         cache = self.backbone(input_ids=prefix, use_cache=True).past_key_values
+        if timing:
+            torch.cuda.synchronize()
+        marks.append((f"prefix {shared}t", _time.perf_counter()))
         out: list[list[float]] = []
         read = shared
         # The questions in batches over one expanded copy of the cache, each
         # right-padded and read at its own last token: one at a time, a
         # plan's thirty questions kept the GPU idle between short passes, and
         # sixteen plans at once queued behind each other for a minute.
-        rows = list(zip(sequences, counts, strict=True))
+        # Batched by length, so a short yes/no is not padded to the longest
+        # choice beside it; answered back in the order asked.
+        order = sorted(range(len(sequences)), key=lambda i: len(sequences[i]))
+        rows = [(sequences[i], counts[i]) for i in order]
         for start in range(0, len(rows), _BRANCH_BATCH):
             chunk = rows[start:start + _BRANCH_BATCH]
             tails = [ids[shared:] for ids, _ in chunk]
@@ -269,6 +280,15 @@ class DecisionModel(torch.nn.Module):
                 row_logits[count:] = -1e9
                 out.append((row_logits / self.temperature).softmax(-1).cpu().tolist())
             read += sum(len(t) for t in tails)
+            marks.append((f"batch {len(chunk)}x{width}t", _time.perf_counter()))
+        unsorted = [None] * len(out)
+        for pos, i in enumerate(order):
+            unsorted[i] = out[pos]
+        out = unsorted
+        if timing:
+            print("autojev timing: " + " ".join(
+                f"{name}={(t - marks[i][1]) * 1000:.0f}ms" for i, (name, t) in enumerate(marks[1:])),
+                flush=True)
         return out, read
 
     def forward(self, batch: PreparedBatch) -> torch.Tensor:
