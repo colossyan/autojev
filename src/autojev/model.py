@@ -259,19 +259,7 @@ class DecisionModel(torch.nn.Module):
         # for that request's batch, they broke every shared read after it.
         # Text has none to keep.
         self.backbone.rope_deltas = None
-        # Where the state ends in the rows: what a later request on the same
-        # state reads on from, whatever its questions open with.
-        first = self.processor.apply_chat_template(
-            decision_messages(rows[0], self.codes), tokenize=False,
-            add_generation_prompt=True, enable_thinking=False,  # type: ignore[arg-type]
-        )
-        cut = first.find("\n\nQuestion:\n")
-        state_end = 0
-        if cut > 0:
-            head = cast(list[int], self.processor.tokenizer(first[:cut], add_special_tokens=False)["input_ids"])
-            if sequences[0][:len(head)] == head and len(head) <= shared:
-                state_end = len(head)
-        cache, known = self._prefix(sequences[0][:shared], device, state_end)
+        cache, known = self._prefix(sequences[0][:shared], device)
         if timing:
             torch.cuda.synchronize()
         marks.append((f"prefix {shared}t ({known} known)", _time.perf_counter()))
@@ -340,12 +328,10 @@ class DecisionModel(torch.nn.Module):
                 flush=True)
         return out, read
 
-    def _prefix(self, ids: list[int], device, state_end: int = 0) -> tuple[Any, int]:
+    def _prefix(self, ids: list[int], device) -> tuple[Any, int]:
         """The cache of reading ``ids``, and how many of them were already
-        read: from the longest kept prefix of them, extended by the rest.
-        Kept at the end of the state as well as at the end of ``ids``: a
-        later request on the same state opens its questions differently.
-        A kept cache is never written to — what extends it is a copy."""
+        read: from the longest kept prefix of them, read on by the rest in
+        one pass. A kept cache is never written to — what reads on is a copy."""
         from collections import OrderedDict
 
         kept: OrderedDict = self.__dict__.setdefault("_kept", OrderedDict())
@@ -358,13 +344,10 @@ class DecisionModel(torch.nn.Module):
         cache = kept[best] if best else None
         if best:
             kept.move_to_end(best)
-        for stop in sorted({state_end, len(key)}):
-            if stop <= len(best) or stop < _PREFIX_MIN and stop != len(key):
-                continue
-            cache = self._read_on(cache, ids[len(best):stop], device)
-            best = key[:stop]
-            if stop >= _PREFIX_MIN:
-                kept[best] = cache
+        if len(best) < len(key):
+            cache = self._read_on(cache, ids[len(best):], device)
+            if len(key) >= _PREFIX_MIN:
+                kept[key] = cache
         while kept and (len(kept) > _PREFIX_ENTRIES
                         or sum(len(k) for k in kept) > _PREFIX_TOKENS):
             kept.popitem(last=False)
