@@ -123,10 +123,12 @@ class Batcher:
     def waiting(self) -> int:
         return self._queue.qsize()
 
-    async def answer(self, rows: list[DecisionInput], questions: list[DecisionQuestion]) -> list[tuple[Answer, int]]:
+    async def answer(self, rows: list[DecisionInput], questions: list[DecisionQuestion],
+                     cached: bool = True) -> list[tuple[Answer, int]]:
         """Each row's answer: given again when the same row was answered
-        before (``answer_cache``), read by the model otherwise."""
-        cache = service.cache
+        before (``answer_cache``), read by the model otherwise. A caller
+        measuring the model itself asks with ``cached`` off."""
+        cache = service.cache if cached else None
         if cache is None:
             return await self._uncached(rows, questions)
         keys = [cache.key(row, question) for row, question in zip(rows, questions, strict=True)]
@@ -511,7 +513,8 @@ def predict(model: DecisionModel, body: EvaluationRequest) -> DecisionResponse:
 
 
 @app.post("/v1/systemone", dependencies=[Depends(authenticate)], response_model=None)
-async def system_one(body: EvaluationRequest) -> DecisionResponse:
+async def system_one(body: EvaluationRequest,
+                     x_autojev_cache: str | None = Header(default=None)) -> DecisionResponse:
     if service.model is None:
         raise HTTPException(503, "The model is not ready.")
     questions = {key: cast(DecisionQuestion, question.model_dump(exclude_none=True))
@@ -521,7 +524,8 @@ async def system_one(body: EvaluationRequest) -> DecisionResponse:
     rows: list[DecisionInput] = [{"state": body.state, "question": question, "images": list(body.images)}
                                  for question in questions.values()]
     try:
-        results = await batcher.answer(rows, list(questions.values()))
+        results = await batcher.answer(rows, list(questions.values()),
+                                       cached=(x_autojev_cache or "").lower() != "off")
     except ValueError as error:
         raise HTTPException(422, str(error)) from error
     answers: dict[str, Answer] = {key: result for key, (result, _) in zip(questions, results, strict=True)}

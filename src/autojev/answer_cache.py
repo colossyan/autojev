@@ -10,7 +10,8 @@ model shared with every other tier.
 The key covers everything the answer depends on, so a new checkpoint or a
 change to how prompts are built asks everything afresh. ``AUTOJEV_ANSWER_CACHE``
 names the file (``off`` disables it); ``AUTOJEV_ANSWER_CACHE_ROWS`` bounds it,
-oldest-used first out.
+oldest-used first out. A request with ``X-AutoJev-Cache: off`` is read by the model
+whatever is kept, and keeps nothing.
 """
 from __future__ import annotations
 
