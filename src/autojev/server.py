@@ -18,7 +18,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from io import BytesIO
 from pathlib import Path
-from typing import TYPE_CHECKING, Annotated, Literal, cast
+from typing import TYPE_CHECKING, Annotated, Any, Literal, cast
 
 from fastapi import Depends, FastAPI, Header, HTTPException, Request
 from fastapi.exceptions import RequestValidationError
@@ -70,6 +70,7 @@ class Service:
     # Whether a request's questions read their shared state once; on only
     # when it answered a sample exactly as the full read does.
     shared: bool = False
+    cache: Any = None
 
 
 service = Service()
@@ -123,6 +124,23 @@ class Batcher:
         return self._queue.qsize()
 
     async def answer(self, rows: list[DecisionInput], questions: list[DecisionQuestion]) -> list[tuple[Answer, int]]:
+        """Each row's answer: given again when the same row was answered
+        before (``answer_cache``), read by the model otherwise."""
+        cache = service.cache
+        if cache is None:
+            return await self._uncached(rows, questions)
+        keys = [cache.key(row, question) for row, question in zip(rows, questions, strict=True)]
+        known = cache.get_many(keys)
+        out: list[tuple[Answer, int] | None] = [(known[k], 0) if k in known else None for k in keys]
+        todo = [i for i, k in enumerate(keys) if k not in known]
+        if todo:
+            read = await self._uncached([rows[i] for i in todo], [questions[i] for i in todo])
+            for i, result in zip(todo, read, strict=True):
+                out[i] = result
+            cache.put_many([(keys[i], result[0]) for i, result in zip(todo, read, strict=True)])
+        return [r for r in out if r is not None]
+
+    async def _uncached(self, rows: list[DecisionInput], questions: list[DecisionQuestion]) -> list[tuple[Answer, int]]:
         loop = asyncio.get_running_loop()
         if service.shared and len(rows) >= max(SHARED_MIN_ROWS, 2) and not any(row.get("images") for row in rows):
             job = _Shared(rows, questions, loop, loop.create_future())
@@ -412,6 +430,8 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
 
     service.checkpoint = os.getenv("AUTOJEV_CHECKPOINT", "checkpoints/selected")
     service.model = await run_in_threadpool(DecisionModel, checkpoint=service.checkpoint)
+    from autojev.answer_cache import open_cache
+    service.cache = open_cache(service.checkpoint)
     service.name = f"autojev-{service.model.base_model.rsplit('/', 1)[-1].lower()}"
     modified = (Path(service.checkpoint) / "decision_config.json").stat().st_mtime
     service.release_date = datetime.fromtimestamp(modified, timezone.utc).date().isoformat()
