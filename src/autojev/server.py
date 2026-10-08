@@ -67,6 +67,23 @@ GPU_CAP = int(float(os.getenv("AUTOJEV_GPU_CAP_GB", "70")) * 2**30)
 _CONTEXT_MARGIN = int(1.5 * 2**30)
 
 
+def _prepare_gpu(torch) -> None:
+    """On the worker thread, in order: the shared-state check (a real read,
+    which also makes this thread's library handles), then the budget."""
+    if os.getenv("AUTOJEV_SHARED_STATE", "1") != "0" and service.model is not None:
+        try:
+            service.shared = _shared_matches(service.model)
+        except Exception as error:  # noqa: BLE001 — the whole read still serves
+            print(f"autojev: shared-state reading unavailable ({error})", flush=True)
+            service.shared = False
+    if torch.cuda.is_available():
+        # cuBLAS and cuBLASLt handles, whatever the check above did or not.
+        a = torch.ones((64, 64), device="cuda", dtype=torch.bfloat16)
+        torch.nn.functional.linear(a, a, a[0]).float().sum().item()
+        del a
+    claim_gpu_budget(torch)
+
+
 def claim_gpu_budget(torch) -> None:
     """Cap PyTorch at the budget and claim all of it now, while it is free:
     an allocation past the cap fails here (and the batch is split) rather
@@ -186,6 +203,10 @@ class Batcher:
         import torch
         from autojev.model import answer
 
+        # Every CUDA library handle this thread needs is made before the
+        # budget is claimed: cuBLAS allocates its own outside PyTorch, from
+        # whatever the card has free, and on a shared card nothing is.
+        _prepare_gpu(torch)
         held: _Pending | None = None
         while True:
             first = held or self._queue.get()
@@ -451,19 +472,13 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
 
     service.checkpoint = os.getenv("AUTOJEV_CHECKPOINT", "checkpoints/selected")
     service.model = await run_in_threadpool(DecisionModel, checkpoint=service.checkpoint)
-    import torch
-    claim_gpu_budget(torch)
     from autojev.answer_cache import open_cache
     service.cache = open_cache(service.checkpoint)
     service.name = f"autojev-{service.model.base_model.rsplit('/', 1)[-1].lower()}"
     modified = (Path(service.checkpoint) / "decision_config.json").stat().st_mtime
     service.release_date = datetime.fromtimestamp(modified, timezone.utc).date().isoformat()
-    if os.getenv("AUTOJEV_SHARED_STATE", "1") != "0":
-        try:
-            service.shared = await run_in_threadpool(_shared_matches, service.model)
-        except Exception as error:  # noqa: BLE001 — the whole read still serves
-            print(f"autojev: shared-state reading unavailable ({error})", flush=True)
-            service.shared = False
+    # The shared-state check and the GPU budget run on the worker thread,
+    # before it takes its first request (``_prepare_gpu``).
     batcher.start()
     try:
         yield
