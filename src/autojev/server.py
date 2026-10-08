@@ -56,8 +56,36 @@ SHARED_MIN_ROWS = int(os.getenv("AUTOJEV_SHARED_MIN_ROWS", "5"))
 # requests and questions: their questions fill common batches.
 SHARED_JOBS = int(os.getenv("AUTOJEV_SHARED_JOBS", "4"))
 SHARED_ROWS = int(os.getenv("AUTOJEV_SHARED_ROWS", "96"))
-# Bytes of GPU memory the allocator may keep reserved between requests.
-RESERVED_CAP = int(float(os.getenv("AUTOJEV_RESERVED_CAP_GB", "56")) * 2**30)
+# The whole process's GPU budget. The card is shared: within it the model
+# holds what it needs and gives none of it back, beyond it nothing. Measured
+# on Palma's GPU3: the old ceiling-less server peaked at 80 GB, and memory it
+# released after a batch was taken by a neighbour's training, after which
+# every request ran out (396 of 400 in one hour).
+GPU_CAP = int(float(os.getenv("AUTOJEV_GPU_CAP_GB", "70")) * 2**30)
+# What the process holds outside PyTorch's allocator (the CUDA context,
+# library workspaces), which the per-process fraction does not count.
+_CONTEXT_MARGIN = int(1.5 * 2**30)
+
+
+def claim_gpu_budget(torch) -> None:
+    """Cap PyTorch at the budget and claim all of it now, while it is free:
+    an allocation past the cap fails here (and the batch is split) rather
+    than taking more of the card, and freed blocks stay with the process."""
+    if not GPU_CAP or not torch.cuda.is_available():
+        return
+    total = torch.cuda.get_device_properties(0).total_memory
+    budget = max(GPU_CAP - _CONTEXT_MARGIN, 0)
+    torch.cuda.set_per_process_memory_fraction(min(1.0, budget / total))
+    spare = budget - torch.cuda.memory_reserved() - 2**28
+    if spare > 0:
+        try:
+            block = torch.empty(spare, dtype=torch.uint8, device="cuda")
+            del block       # back to the allocator's cache, not to the card
+        except torch.cuda.OutOfMemoryError:
+            print("autojev: could not claim the whole GPU budget up front; "
+                  "it is taken as requests need it", flush=True)
+    print(f"autojev: GPU budget {GPU_CAP / 2**30:.0f} GiB; holding "
+          f"{torch.cuda.memory_reserved() / 2**30:.1f} GiB", flush=True)
 
 
 @dataclass
@@ -198,20 +226,12 @@ class Batcher:
             try:
                 read_all = _profiled(lambda: model.shared_distributions_many([job.rows for job in jobs]), torch)
             except torch.cuda.OutOfMemoryError:
-                # Read together they did not fit beside the GPU's other
-                # tenants; one at a time they do, and nobody gets an error.
+                # Read together they did not fit in the budget; one at a time
+                # they do, and nobody gets an error.
                 if len(jobs) == 1:
                     raise
-                torch.cuda.empty_cache()
                 read_all = [model.shared_distributions(job.rows) for job in jobs]
-            # Batched reads of many states leave the allocator holding blocks
-            # sized for them; past this, give them back rather than keep a
-            # GPU shared with other services at its high-water mark.
-            if torch.cuda.is_available() and torch.cuda.memory_reserved() > RESERVED_CAP:
-                torch.cuda.empty_cache()
         except Exception as error:  # noqa: BLE001
-            if isinstance(error, torch.cuda.OutOfMemoryError):
-                torch.cuda.empty_cache()
             for job in jobs:
                 job.loop.call_soon_threadsafe(_settle, job.future, None, error)
             return
@@ -231,7 +251,6 @@ class Batcher:
         except torch.cuda.OutOfMemoryError as error:
             # Too much for one pass after all: halve it, down to one row,
             # rather than fail every caller who shared it.
-            torch.cuda.empty_cache()
             if len(items) == 1:
                 items[0].loop.call_soon_threadsafe(_settle, items[0].future, None, error)
                 return
@@ -432,6 +451,8 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
 
     service.checkpoint = os.getenv("AUTOJEV_CHECKPOINT", "checkpoints/selected")
     service.model = await run_in_threadpool(DecisionModel, checkpoint=service.checkpoint)
+    import torch
+    claim_gpu_budget(torch)
     from autojev.answer_cache import open_cache
     service.cache = open_cache(service.checkpoint)
     service.name = f"autojev-{service.model.base_model.rsplit('/', 1)[-1].lower()}"
