@@ -65,6 +65,9 @@ GPU_CAP = int(float(os.getenv("AUTOJEV_GPU_CAP_GB", "70")) * 2**30)
 # What the process holds outside PyTorch's allocator (the CUDA context,
 # library workspaces), which the per-process fraction does not count.
 _CONTEXT_MARGIN = int(1.5 * 2**30)
+# Room kept free inside the budget for one pass's activations; the prefix
+# cache gives way above it.
+ACTIVATION_RESERVE = int(float(os.getenv("AUTOJEV_ACTIVATION_RESERVE_GB", "8")) * 2**30)
 
 
 def _prepare_gpu(torch) -> None:
@@ -93,6 +96,8 @@ def claim_gpu_budget(torch) -> None:
     total = torch.cuda.get_device_properties(0).total_memory
     budget = max(GPU_CAP - _CONTEXT_MARGIN, 0)
     torch.cuda.set_per_process_memory_fraction(min(1.0, budget / total))
+    import autojev.model as model_module
+    model_module._PREFIX_CEILING = max(budget - ACTIVATION_RESERVE, 0)
     spare = budget - torch.cuda.memory_reserved() - 2**28
     if spare > 0:
         try:
@@ -248,9 +253,11 @@ class Batcher:
                 read_all = _profiled(lambda: model.shared_distributions_many([job.rows for job in jobs]), torch)
             except torch.cuda.OutOfMemoryError:
                 # Read together they did not fit in the budget; one at a time
-                # they do, and nobody gets an error.
+                # they do, and nobody gets an error. One alone gets the room
+                # the kept prefixes held.
+                from autojev.model import forget_prefixes
                 if len(jobs) == 1:
-                    raise
+                    forget_prefixes(model)
                 read_all = [model.shared_distributions(job.rows) for job in jobs]
         except Exception as error:  # noqa: BLE001
             for job in jobs:
@@ -272,8 +279,14 @@ class Batcher:
         except torch.cuda.OutOfMemoryError as error:
             # Too much for one pass after all: halve it, down to one row,
             # rather than fail every caller who shared it.
+            from autojev.model import forget_prefixes
+            forget_prefixes(service.model)
             if len(items) == 1:
-                items[0].loop.call_soon_threadsafe(_settle, items[0].future, None, error)
+                # One row, with the kept prefixes' room back: once more.
+                try:
+                    self._pass(items, answer, torch)
+                except Exception as again:  # noqa: BLE001
+                    items[0].loop.call_soon_threadsafe(_settle, items[0].future, None, again)
                 return
             half = len(items) // 2
             self._answer(items[:half], answer, torch)

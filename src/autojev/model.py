@@ -157,6 +157,19 @@ _PREFIX_ENTRIES = int(os.getenv("AUTOJEV_PREFIX_ENTRIES", "64"))
 _PREFIX_TOKENS = int(os.getenv("AUTOJEV_PREFIX_TOKENS", "131072"))
 # A cached prefix shorter than this is not worth looking up and keeping.
 _PREFIX_MIN = 64
+# Allocated bytes past which kept prefixes are dropped, oldest first; set by
+# the server from its GPU budget (None: bounded by entries and tokens only).
+# Counted in tokens alone the cache outgrew the budget: the full-attention
+# layers keep 64 KB a token and every entry holds the linear layers' states,
+# and a capped server then failed requests for want of a few MB.
+_PREFIX_CEILING: int | None = None
+
+
+def _over_ceiling() -> bool:
+    if _PREFIX_CEILING is None:
+        return False
+    import torch
+    return torch.cuda.is_available() and torch.cuda.memory_allocated() > _PREFIX_CEILING
 
 
 class DecisionModel(torch.nn.Module):
@@ -457,7 +470,8 @@ class DecisionModel(torch.nn.Module):
                 one.layers.append(new)
             kept[tuple(ids)] = one
         while kept and (len(kept) > _PREFIX_ENTRIES
-                        or sum(len(k) for k in kept) > _PREFIX_TOKENS):
+                        or sum(len(k) for k in kept) > _PREFIX_TOKENS
+                        or _over_ceiling()):
             kept.popitem(last=False)
 
     def _prefix(self, ids: list[int], device) -> tuple[Any, int]:
@@ -481,7 +495,8 @@ class DecisionModel(torch.nn.Module):
             if len(key) >= _PREFIX_MIN:
                 kept[key] = cache
         while kept and (len(kept) > _PREFIX_ENTRIES
-                        or sum(len(k) for k in kept) > _PREFIX_TOKENS):
+                        or sum(len(k) for k in kept) > _PREFIX_TOKENS
+                        or _over_ceiling()):
             kept.popitem(last=False)
         return cache, known
 
@@ -536,3 +551,10 @@ class DecisionModel(torch.nn.Module):
         config.update({"format_version": 1, "base_model": self.base_model, "revision": self.revision,
                        "codes": list(self.codes), "token_ids": list(self.token_ids), "temperature": scale})
         (destination / "decision_config.json").write_text(json.dumps(config, indent=2) + "\n")
+
+
+def forget_prefixes(model) -> None:
+    """Drop every kept prefix (to make room)."""
+    kept = model.__dict__.get("_kept")
+    if kept:
+        kept.clear()
